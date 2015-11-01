@@ -10,6 +10,8 @@ import osp.Devices.*;
 import osp.Memory.*;
 import osp.Resources.*;
 
+import java.util.*;
+
 /**
    This class is responsible for actions related to threads, including
    creating, killing, dispatching, resuming, and suspending threads.
@@ -18,6 +20,9 @@ import osp.Resources.*;
 */
 public class ThreadCB extends IflThreadCB 
 {
+	private static ReadyQueue readyQueue = new ReadyQueue();
+	
+	
     /**
        The thread constructor. Must call 
 
@@ -41,7 +46,6 @@ public class ThreadCB extends IflThreadCB
     public static void init()
     {
         // your code goes here
-
     }
 
     /** 
@@ -64,8 +68,29 @@ public class ThreadCB extends IflThreadCB
     static public ThreadCB do_create(TaskCB task)
     {
         // your code goes here
-    	return null;
-
+    	// First condition: Check to make sure the task is not at maximum threads per task
+    	if (task.getThreadCount() >= MaxThreadsPerTask) {
+    		return null; // If so, return null
+    	}
+    	else {
+    		ThreadCB newThread = new ThreadCB();
+    		
+    		// Add the new thread to task, make sure it doesn't fail
+    		if (task.addThread(newThread) == FAILURE) {
+    			return null; // if new thread fails to add, return null
+    		}
+    		else {
+    			newThread.setTask(task);
+    		}
+    		
+    		newThread.setPriority(1); // We're not using a priority queue so choose arbitrary number
+    		newThread.setStatus(ThreadReady);
+    		readyQueue.append(newThread);
+    		
+    		dispatch();
+    		
+    		return newThread;		
+    	}
     }
 
     /** 
@@ -84,14 +109,42 @@ public class ThreadCB extends IflThreadCB
     public void do_kill()
     {
         // your code goes here
-
+    	int status = this.getStatus();
+    	this.setStatus(ThreadKill);
+    	
+    	TaskCB task = this.getTask();
+    	task.removeThread(this); // Disassociate killed thread from task
+    	
+    	if (status == ThreadReady) {
+    		readyQueue.removeAThread(this);
+    	}
+    	else if (status == ThreadRunning) {
+    		MMU.setPTBR(null);
+    		task.setCurrentThread(null);
+    	}
+    	else if (status >= ThreadWaiting) {
+    		for (int i = 0; i < Device.getTableSize(); i++) {
+    			Device.get(i).cancelPendingIO(this);
+    		}
+    	}
+    	
+    	// Release any resources this thread claimed
+    	ResourceCB.giveupResources(this);
+    	
+    	// Always dispatch() regardless
+    	dispatch();
+    	
+    	// Lastly, check to see if task has no threads, if so, then kill task
+    	if (task.getThreadCount() == 0) {
+    		task.kill();
+    	}
     }
 
-    /** Suspends the thread that is currenly on the processor on the 
+    /** Suspends the thread that is currently on the processor on the 
         specified event. 
 
         Note that the thread being suspended doesn't need to be
-        running. It can also be waiting for completion of a pagefault
+        running. It can also be waiting for completion of a page fault
         and be suspended on the IORB that is bringing the page in.
 	
 	Thread's status must be changed to ThreadWaiting or higher,
@@ -106,7 +159,19 @@ public class ThreadCB extends IflThreadCB
     public void do_suspend(Event event)
     {
         // your code goes here
-
+    	if (this.getStatus() == ThreadRunning) {
+    		this.setStatus(ThreadWaiting);
+    		MMU.setPTBR(null);
+    		this.getTask().setCurrentThread(null);
+    	}
+    	else if (this.getStatus() >= ThreadWaiting) {
+    		this.setStatus(this.getStatus()+1);
+    	}
+    	// Add to event queue
+    	event.addThread(this);
+    	
+    	// Always dispatch() regardless
+    	dispatch();
     }
 
     /** Resumes the thread.
@@ -121,13 +186,33 @@ public class ThreadCB extends IflThreadCB
     public void do_resume()
     {
         // your code goes here
-
+    	if (this.getStatus() < ThreadWaiting) {
+    		MyOut.print(this, "Attempt to resume " + this + ", which wasn't waiting");
+    		return;
+    	}
+    	
+    	MyOut.print(this,  "Resuming " + this);
+    	
+    	// Set thread's status.
+    	if (this.getStatus() == ThreadWaiting) {
+    		this.setStatus(ThreadReady);
+    	}
+    	else if (this.getStatus() > ThreadWaiting) {
+    		this.setStatus(this.getStatus()-1);
+    	}
+    	
+    	// Put the thread on the ready queue, if appropriate
+    	if (this.getStatus() == ThreadReady) {
+    		readyQueue.append(this);
+    	}
+    	
+    	dispatch();
     }
 
     /** 
         Selects a thread from the run queue and dispatches it. 
 
-        If there is just one theread ready to run, reschedule the thread 
+        If there is just one thread ready to run, reschedule the thread 
         currently on the processor.
 
         In addition to setting the correct thread status it must
@@ -140,8 +225,20 @@ public class ThreadCB extends IflThreadCB
     public static int do_dispatch()
     {
         // your code goes here
-    	return 1;
-
+    	if ((MMU.getPTBR() != null) && (MMU.getPTBR().getTask().getCurrentThread() != null)) {
+    		return SUCCESS; // There is a thread currently running, we aren't preemptive
+    	}
+    	else if (readyQueue.peek() == null) {
+    		return FAILURE; // There is no thread running and there is NO ready thread
+    	}
+    	else {
+    		// There is no thread running, but we have a thread ready to be scheduled
+    		ThreadCB thread = readyQueue.remove();
+    		MMU.setPTBR(thread.getTask().getPageTable());
+    		thread.getTask().setCurrentThread(thread);
+    		thread.setStatus(ThreadRunning);
+    		return SUCCESS;
+    	}
     }
 
     /**
@@ -181,3 +278,30 @@ public class ThreadCB extends IflThreadCB
 /*
       Feel free to add local classes to improve the readability of your code
 */
+
+class ReadyQueue {
+	
+	
+	private Queue<ThreadCB> readyQueue;
+	
+	
+	public ReadyQueue() {
+		this.readyQueue = new LinkedList<ThreadCB>();
+	}
+	
+	public void append(ThreadCB thread) {
+		this.readyQueue.add(thread);
+	}
+	
+	public ThreadCB remove() {
+		return this.readyQueue.remove();
+	}
+	
+	public void removeAThread(ThreadCB thread) {
+		this.readyQueue.remove(thread);
+	}
+	
+	public ThreadCB peek() {
+		return this.readyQueue.peek();
+	}
+}
